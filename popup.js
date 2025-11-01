@@ -1,4 +1,5 @@
 let isEnabled = true;
+let useAI = true;
 
 document.addEventListener('DOMContentLoaded', async () => {
   await loadSettings();
@@ -7,9 +8,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 async function loadSettings() {
-  const settings = await chrome.storage.sync.get(['enabled']);
+  const settings = await chrome.storage.sync.get(['enabled', 'useAI']);
   isEnabled = settings.enabled !== false;
+  useAI = settings.useAI !== false;
   document.getElementById('toggleDetection').checked = isEnabled;
+  document.getElementById('toggleAI').checked = useAI;
 }
 
 async function loadPatterns() {
@@ -107,6 +110,24 @@ function setupEventListeners() {
       chrome.tabs.sendMessage(tab.id, {
         type: 'TOGGLE_DETECTION',
         enabled: isEnabled
+      }, () => {
+        if (!chrome.runtime.lastError) {
+          loadPatterns();
+        }
+      });
+    }
+  });
+
+  const toggleAI = document.getElementById('toggleAI');
+  toggleAI.addEventListener('change', async (e) => {
+    useAI = e.target.checked;
+    await chrome.storage.sync.set({ useAI: useAI });
+    
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab && tab.id) {
+      chrome.tabs.sendMessage(tab.id, {
+        type: 'TOGGLE_AI',
+        useAI: useAI
       }, () => {
         if (!chrome.runtime.lastError) {
           loadPatterns();

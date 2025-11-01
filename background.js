@@ -2,7 +2,7 @@ let detectionEnabled = true;
 let patternCounts = {};
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.storage.sync.set({ enabled: true });
+  chrome.storage.sync.set({ enabled: true, useAI: true });
   console.log('Patch - Dark Pattern Detector installed');
 });
 
@@ -247,16 +247,31 @@ function calculateConfidence(patterns) {
 }
 
 chrome.storage.onChanged.addListener((changes, namespace) => {
-  if (namespace === 'sync' && changes.enabled) {
-    detectionEnabled = changes.enabled.newValue;
-    
-    chrome.tabs.query({}, (tabs) => {
-      tabs.forEach(tab => {
-        chrome.tabs.sendMessage(tab.id, {
-          type: 'TOGGLE_DETECTION',
-          enabled: detectionEnabled
-        }).catch(() => {});
+  if (namespace === 'sync') {
+    if (changes.enabled) {
+      detectionEnabled = changes.enabled.newValue;
+      
+      chrome.tabs.query({}, (tabs) => {
+        tabs.forEach(tab => {
+          chrome.tabs.sendMessage(tab.id, {
+            type: 'TOGGLE_DETECTION',
+            enabled: detectionEnabled
+          }).catch(() => {});
+        });
       });
-    });
+    }
+    
+    if (changes.useAI) {
+      const useAI = changes.useAI.newValue;
+      
+      chrome.tabs.query({}, (tabs) => {
+        tabs.forEach(tab => {
+          chrome.tabs.sendMessage(tab.id, {
+            type: 'TOGGLE_AI',
+            useAI: useAI
+          }).catch(() => {});
+        });
+      });
+    }
   }
 });

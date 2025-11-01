@@ -121,12 +121,22 @@ class DarkPatternDetector {
     this.detectedPatterns = new Map();
     this.observer = null;
     this.isEnabled = true;
+    this.useAI = true;
+    this.aiQueue = [];
+    this.aiInFlight = 0;
+    this.aiTotalCalls = 0;
+    this.analyzedElements = new WeakMap();
+    this.MAX_CONCURRENT_AI = 3;
+    this.MAX_TOTAL_AI = 30;
+    this.MIN_INTERVAL_MS = 250;
+    this.lastAICall = 0;
     this.init();
   }
 
   async init() {
-    const settings = await chrome.storage.sync.get(['enabled']);
+    const settings = await chrome.storage.sync.get(['enabled', 'useAI']);
     this.isEnabled = settings.enabled !== false;
+    this.useAI = settings.useAI !== false;
     
     if (this.isEnabled) {
       this.scanPage();
@@ -135,9 +145,13 @@ class DarkPatternDetector {
   }
 
   setupObserver() {
+    let debounceTimer = null;
     this.observer = new MutationObserver((mutations) => {
       if (this.isEnabled) {
-        this.scanPage();
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          this.scanPage();
+        }, 200);
       }
     });
 
@@ -159,6 +173,137 @@ class DarkPatternDetector {
     this.updateBadge();
   }
 
+  isElementInViewport(element) {
+    const rect = element.getBoundingClientRect();
+    return (
+      rect.top >= 0 &&
+      rect.left >= 0 &&
+      rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) &&
+      rect.right <= (window.innerWidth || document.documentElement.clientWidth) &&
+      rect.width > 0 &&
+      rect.height > 0
+    );
+  }
+
+  gatherContext(element) {
+    const parent = element.parentElement;
+    const siblings = parent ? Array.from(parent.children).filter(c => c !== element) : [];
+    const parentText = parent ? parent.textContent.substring(0, 200) : '';
+    const siblingTexts = siblings.slice(0, 3).map(s => s.textContent.substring(0, 50)).join(' ');
+    return `${parentText} ${siblingTexts}`.trim();
+  }
+
+  isAmbiguousButton(text) {
+    const persuasionVerbs = ['accept', 'agree', 'continue', 'subscribe', 'confirm', 'yes', 'ok', 'allow'];
+    const hasPersuasion = persuasionVerbs.some(verb => text.includes(verb));
+    const hasNegation = text.includes('no') || text.includes("don't") || text.includes('not');
+    return (hasPersuasion || hasNegation) && text.length > 3 && text.length < 100;
+  }
+
+  isAmbiguousText(text) {
+    const urgencyTerms = ['limited', 'hurry', 'expires', 'ending', 'last', 'only'];
+    const scarcityTerms = ['sold out', 'running out', 'low stock', 'almost gone'];
+    const hasUrgency = urgencyTerms.some(term => text.includes(term));
+    const hasScarcity = scarcityTerms.some(term => text.includes(term));
+    return (hasUrgency || hasScarcity) && text.length >= 10 && text.length <= 200;
+  }
+
+  isAmbiguousCheckbox(labelText) {
+    const hasNegation = labelText.includes("don't") || labelText.includes('not') || labelText.includes('disable');
+    const hasAction = labelText.includes('send') || labelText.includes('share') || labelText.includes('notify');
+    return hasNegation && hasAction;
+  }
+
+  isAmbiguousPricing(text) {
+    const costTerms = ['fee', 'charge', 'surcharge', 'additional', 'extra'];
+    return costTerms.some(term => text.includes(term)) && text.length < 100;
+  }
+
+  async maybeEnqueueAI(element, elementType, text, matchedHeuristic) {
+    if (!this.useAI || matchedHeuristic || this.analyzedElements.has(element)) {
+      return;
+    }
+
+    if (this.aiTotalCalls >= this.MAX_TOTAL_AI) {
+      return;
+    }
+
+    if (!this.isElementInViewport(element)) {
+      return;
+    }
+
+    let isAmbiguous = false;
+    if (elementType === 'button' || elementType === 'link') {
+      isAmbiguous = this.isAmbiguousButton(text);
+    } else if (elementType === 'text') {
+      isAmbiguous = this.isAmbiguousText(text);
+    } else if (elementType === 'checkbox') {
+      isAmbiguous = this.isAmbiguousCheckbox(text);
+    } else if (elementType === 'price') {
+      isAmbiguous = this.isAmbiguousPricing(text);
+    }
+
+    if (!isAmbiguous) {
+      return;
+    }
+
+    this.analyzedElements.set(element, true);
+
+    const context = this.gatherContext(element);
+    this.aiQueue.push({
+      element,
+      elementType,
+      text,
+      context
+    });
+
+    this.processAIQueue();
+  }
+
+  async processAIQueue() {
+    while (this.aiQueue.length > 0 && this.aiInFlight < this.MAX_CONCURRENT_AI && this.aiTotalCalls < this.MAX_TOTAL_AI) {
+      const now = Date.now();
+      const timeSinceLastCall = now - this.lastAICall;
+      
+      if (timeSinceLastCall < this.MIN_INTERVAL_MS) {
+        setTimeout(() => this.processAIQueue(), this.MIN_INTERVAL_MS - timeSinceLastCall);
+        return;
+      }
+
+      const job = this.aiQueue.shift();
+      this.aiInFlight++;
+      this.aiTotalCalls++;
+      this.lastAICall = now;
+
+      try {
+        const response = await chrome.runtime.sendMessage({
+          type: 'ANALYZE_WITH_AI',
+          data: {
+            text: job.text,
+            context: job.context,
+            elementType: job.elementType
+          }
+        });
+
+        if (response && response.result && response.result.detected) {
+          response.result.patterns.forEach(pattern => {
+            const patternKey = pattern.type;
+            if (DARK_PATTERNS[patternKey]) {
+              this.flagElement(job.element, DARK_PATTERNS[patternKey]);
+            }
+          });
+        }
+      } catch (error) {
+        console.error('AI analysis error:', error);
+      } finally {
+        this.aiInFlight--;
+        if (this.aiQueue.length > 0) {
+          setTimeout(() => this.processAIQueue(), this.MIN_INTERVAL_MS);
+        }
+      }
+    }
+  }
+
   scanButtons() {
     const buttons = document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]');
     
@@ -168,17 +313,24 @@ class DarkPatternDetector {
       const text = this.getElementText(button).toLowerCase();
       const style = window.getComputedStyle(button);
       
+      let matchedHeuristic = false;
+      
       if (this.detectConfirmShaming(text)) {
         this.flagElement(button, DARK_PATTERNS.CONFIRM_SHAMING);
+        matchedHeuristic = true;
       }
       
       if (this.detectUrgency(text)) {
         this.flagElement(button, DARK_PATTERNS.URGENCY);
+        matchedHeuristic = true;
       }
       
       if (this.detectMisdirection(button, style)) {
         this.flagElement(button, DARK_PATTERNS.MISDIRECTION);
+        matchedHeuristic = true;
       }
+      
+      this.maybeEnqueueAI(button, 'button', text, matchedHeuristic);
       
       button.setAttribute('data-patch-analyzed', 'true');
     });
@@ -193,13 +345,19 @@ class DarkPatternDetector {
       const text = this.getElementText(link).toLowerCase();
       const href = link.getAttribute('href') || '';
       
+      let matchedHeuristic = false;
+      
       if (this.detectRoachMotel(text, href)) {
         this.flagElement(link, DARK_PATTERNS.ROACH_MOTEL);
+        matchedHeuristic = true;
       }
       
       if (this.detectConfirmShaming(text)) {
         this.flagElement(link, DARK_PATTERNS.CONFIRM_SHAMING);
+        matchedHeuristic = true;
       }
+      
+      this.maybeEnqueueAI(link, 'link', text, matchedHeuristic);
       
       link.setAttribute('data-patch-analyzed', 'true');
     });
@@ -237,10 +395,15 @@ class DarkPatternDetector {
       const label = this.findLabelForInput(checkbox);
       const labelText = label ? this.getElementText(label).toLowerCase() : '';
       
+      let matchedHeuristic = false;
+      
       if (this.detectTrickQuestion(labelText)) {
         this.flagElement(label || checkbox.parentElement, DARK_PATTERNS.TRICK_QUESTIONS);
         this.clarifyTrickQuestion(label || checkbox.parentElement, labelText);
+        matchedHeuristic = true;
       }
+      
+      this.maybeEnqueueAI(label || checkbox.parentElement, 'checkbox', labelText, matchedHeuristic);
       
       checkbox.addEventListener('change', () => {
         checkbox.setAttribute('data-user-interaction', 'true');
@@ -259,17 +422,24 @@ class DarkPatternDetector {
       
       const text = this.getElementText(element).toLowerCase();
       
+      let matchedHeuristic = false;
+      
       if (this.detectScarcity(text)) {
         this.flagElement(element, DARK_PATTERNS.SCARCITY);
+        matchedHeuristic = true;
       }
       
       if (this.detectUrgency(text)) {
         this.flagElement(element, DARK_PATTERNS.URGENCY);
+        matchedHeuristic = true;
       }
       
       if (this.detectPrivacyZuckering(text)) {
         this.flagElement(element, DARK_PATTERNS.PRIVACY_ZUCKERING);
+        matchedHeuristic = true;
       }
+      
+      this.maybeEnqueueAI(element, 'text', text, matchedHeuristic);
       
       element.setAttribute('data-patch-analyzed', 'true');
     });
@@ -283,10 +453,15 @@ class DarkPatternDetector {
       
       const text = this.getElementText(element).toLowerCase();
       
+      let matchedHeuristic = false;
+      
       if (this.detectHiddenCosts(text)) {
         this.flagElement(element, DARK_PATTERNS.HIDDEN_COSTS);
         this.highlightHiddenCost(element);
+        matchedHeuristic = true;
       }
+      
+      this.maybeEnqueueAI(element, 'price', text, matchedHeuristic);
       
       element.setAttribute('data-patch-analyzed', 'true');
     });
@@ -504,6 +679,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     } else {
       detector.disable();
     }
+    sendResponse({ success: true });
+  } else if (message.type === 'TOGGLE_AI') {
+    detector.useAI = message.useAI;
     sendResponse({ success: true });
   } else if (message.type === 'GET_PATTERNS') {
     const patterns = Array.from(detector.detectedPatterns.values()).map(p => ({
